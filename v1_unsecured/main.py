@@ -96,6 +96,7 @@ class GithubClient:
         response = requests.put(url, headers=self.headers, json=payload)
         if response.status_code != 200:
             logger.warning(f"Failed to merge PR #{pr_number} - {response.text}")
+            response.raise_for_status()
         else:
             logger.info(f"Successfully merged PR #{pr_number}")
 
