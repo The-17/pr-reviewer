@@ -216,3 +216,20 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local Session Files
+book/
+DECISIONS.md
+
+# Local Environment & Virtualenvs
+.env
+.venv/
+v1_unsecured/.env
+v1_unsecured/.venv/
+v2_agentsecrets_core/.env
+v2_agentsecrets_core/.venv/
+
+# Test scripts
+create_test_branches.sh
+
+
