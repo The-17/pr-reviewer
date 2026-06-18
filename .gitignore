@@ -233,3 +233,5 @@ v2_agentsecrets_core/.venv/
 create_test_branches.sh
 
 
+book/
+sandbox.py
