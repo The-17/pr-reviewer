@@ -36,9 +36,6 @@ class GithubClient:
         self.token = token
         self.owner = owner
         self.repo = repo
-        # Target repository API base URL.
-        # Set to organization target: https://api.github.com/repos/the-17/pr-reviewer
-        # To use a personal account, change owner to your username (e.g. https://api.github.com/repos/username/pr-reviewer)
         self.base_url = f"https://api.github.com/repos/{owner}/{repo}"
         self.headers = {
             "Authorization": f"token {token}",
@@ -100,67 +97,132 @@ class GithubClient:
         else:
             logger.info(f"Successfully merged PR #{pr_number}")
 
-
 class GeminiClient:
-    """Handles communication with the Google Gemini API using Structured Outputs."""
+    """Handles communication with the Google Gemini API using ReAct Tool-Calling."""
     def __init__(self, api_key):
         self.api_key = api_key
         self.url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
-
-    def review_diffs(self, file_diffs_text):
-        """Submits PR diffs to the LLM and requests a structured JSON review response."""
-        system_instruction = (
-            "You are a production-grade automated code reviewer.\n"
+        self.system_instruction = (
+            "You are a production-grade automated code reviewer ReAct agent.\n"
+            "You are equipped with tools to assist you:\n"
+            "- `read_repo_file`: inspect any file in the workspace.\n"
+            "- `post_line_comment`: post a review comment on a specific line of a file in the PR.\n"
+            "- `submit_review`: submit the final decision (APPROVE or REJECT) and overall summary of the PR.\n\n"
             "Analyze the changes in the provided diffs. Look for security flaws, bugs, and style issues.\n"
-            "You must output a structured JSON review adhering to the specified schema.\n"
-            "Set decision to 'REJECT' if any critical security issue or bug is identified.\n"
-            "CRITICAL: The 'file' field in each comment MUST match exactly the filename provided in the diff header (e.g. '--- File: <filename>'). Do not prepend, alter, or double the directory name of the filename.\n"
-            # "EXCEPTION: If the diff contains baseline implementations under 'v1_unsecured/', you must still leave comments identifying security issues but set the overall decision to 'APPROVE' so it can be merged."
+            "If you need to inspect related files (such as config, env, or dependencies) to perform the review, use `read_repo_file`.\n"
+            "You must call `post_line_comment` for any issue you find.\n"
+            "Once you are done, you MUST call `submit_review` to complete the review lifecycle.\n"
+            "Set the decision to 'REJECT' if any critical security issue or bug is identified."
         )
 
-        schema = {
-            "type": "OBJECT",
-            "properties": {
-                "summary": {"type": "STRING"},
-                "decision": {"type": "STRING", "enum": ["APPROVE", "REJECT"]},
-                "comments": {
-                    "type": "ARRAY",
-                    "items": {
-                        "type": "OBJECT",
-                        "properties": {
-                            "file": {"type": "STRING"},
-                            "line": {"type": "INTEGER"},
-                            "category": {"type": "STRING", "enum": ["security", "performance", "style", "bug"]},
-                            "severity": {"type": "STRING", "enum": ["high", "medium", "low"]},
-                            "message": {"type": "STRING"},
-                            "suggestion": {"type": "STRING"}
-                        },
-                        "required": ["file", "line", "category", "severity", "message"]
-                    }
+    def chat(self, messages, tools_decl):
+        gemini_contents = []
+        for msg in messages:
+            role = msg["role"]
+            if role == "user":
+                gemini_contents.append({
+                    "role": "user",
+                    "parts": [{"text": msg["content"]}]
+                })
+            elif role == "assistant":
+                parts = []
+                if msg.get("content"):
+                    parts.append({"text": msg["content"]})
+                if msg.get("tool_calls"):
+                    for tc in msg["tool_calls"]:
+                        parts.append({
+                            "functionCall": {
+                                "name": tc["name"],
+                                "args": tc["args"]
+                            }
+                        })
+                gemini_contents.append({
+                    "role": "model",
+                    "parts": parts
+                })
+            elif role == "tool":
+                gemini_contents.append({
+                    "role": "function",
+                    "parts": [{
+                        "functionResponse": {
+                            "name": msg["name"],
+                            "response": {"content": msg["content"]}
+                        }
+                    }]
+                })
+
+        function_declarations = []
+        for tool in tools_decl:
+            fd = {
+                "name": tool["name"],
+                "description": tool["description"],
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {},
+                    "required": tool["parameters"].get("required", [])
                 }
-            },
-            "required": ["summary", "decision", "comments"]
-        }
+            }
+            for prop_name, prop_val in tool["parameters"]["properties"].items():
+                fd["parameters"]["properties"][prop_name] = {
+                    "type": prop_val["type"].upper(),
+                    "description": prop_val.get("description", "")
+                }
+                if "enum" in prop_val:
+                    fd["parameters"]["properties"][prop_name]["enum"] = prop_val["enum"]
+            function_declarations.append(fd)
 
         payload = {
-            "systemInstruction": {"parts": [{"text": system_instruction}]},
-            "contents": [{"parts": [{"text": f"Review these diffs:\n{file_diffs_text}"}]}],
-            "generationConfig": {
-                "responseMimeType": "application/json",
-                "responseSchema": schema
-            }
+            "systemInstruction": {"parts": [{"text": self.system_instruction}]},
+            "contents": gemini_contents,
+            "tools": [{"functionDeclarations": function_declarations}]
         }
 
-        logger.info("Submitting diffs to Gemini for review...")
         response = requests.post(self.url, json=payload, headers={"Content-Type": "application/json"})
         response.raise_for_status()
 
-        text = response.json()["candidates"][0]["content"]["parts"][0]["text"]
-        return json.loads(text)
+        resp_json = response.json()
+        candidate = resp_json["candidates"][0]
+        content = candidate["content"]
+        parts = content.get("parts", [])
 
+        reply_text = ""
+        tool_calls = []
+        for part in parts:
+            if "text" in part:
+                reply_text += part["text"]
+            if "functionCall" in part:
+                fc = part["functionCall"]
+                tool_calls.append({
+                    "id": None,
+                    "name": fc["name"],
+                    "args": fc.get("args", {})
+                })
+
+        assistant_msg = {
+            "role": "assistant",
+            "content": reply_text if reply_text else None
+        }
+        if tool_calls:
+            assistant_msg["tool_calls"] = tool_calls
+
+        class ChatResponse:
+            def __init__(self, message, text, tool_calls):
+                self.message = message
+                self.text = text
+                self.tool_calls = tool_calls
+
+        return ChatResponse(assistant_msg, reply_text, tool_calls)
+
+    def format_tool_response(self, tool_call_id, name, content):
+        return {
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "name": name,
+            "content": str(content)
+        }
 
 class NvidiaClient:
-    """Handles communication with the NVIDIA API Catalog (OpenAI compatible)."""
+    """Handles communication with the NVIDIA API Catalog (OpenAI compatible) with Tool-Calling."""
     def __init__(self, api_key, model="meta/llama-3.1-70b-instruct"):
         self.api_key = api_key
         self.model = model
@@ -169,40 +231,70 @@ class NvidiaClient:
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
         }
-
-    def review_diffs(self, file_diffs_text):
-        """Submits PR diffs to the NVIDIA API and requests a JSON review response."""
-        system_instruction = (
-            "You are a production-grade automated code reviewer.\n"
+        self.system_instruction = (
+            "You are a production-grade automated code reviewer ReAct agent.\n"
+            "You are equipped with tools to assist you:\n"
+            "- `read_repo_file`: inspect any file in the workspace.\n"
+            "- `post_line_comment`: post a review comment on a specific line of a file in the PR.\n"
+            "- `submit_review`: submit the final decision (APPROVE or REJECT) and overall summary of the PR.\n\n"
             "Analyze the changes in the provided diffs. Look for security flaws, bugs, and style issues.\n"
-            "You must output a structured JSON review adhering to this exact schema:\n"
-            "{\n"
-            "  \"summary\": \"Overall summary of the review\",\n"
-            "  \"decision\": \"APPROVE\" or \"REJECT\",\n"
-            "  \"comments\": [\n"
-            "    {\n"
-            "      \"file\": \"filename\",\n"
-            "      \"line\": 12,\n"
-            "      \"category\": \"security\" | \"performance\" | \"style\" | \"bug\",\n"
-            "      \"severity\": \"high\" | \"medium\" | \"low\",\n"
-            "      \"message\": \"description of the issue\",\n"
-            "      \"suggestion\": \"code replacement or fix recommendation\"\n"
-            "    }\n"
-            "  ]\n"
-            "}\n"
-            "Set decision to 'REJECT' if any critical security issue or bug is identified.\n"
-            "CRITICAL: The 'file' field in each comment MUST match exactly the filename provided in the diff header (e.g. '--- File: <filename>'). Do not prepend, alter, or double the directory name of the filename.\n"
+            "If you need to inspect related files (such as config, env, or dependencies) to perform the review, use `read_repo_file`.\n"
+            "You must call `post_line_comment` for any issue you find.\n"
+            "Once you are done, you MUST call `submit_review` to complete the review lifecycle.\n"
+            "Set the decision to 'REJECT' if any critical security issue or bug is identified."
         )
+
+    def chat(self, messages, tools_decl):
+        nvidia_messages = [{"role": "system", "content": self.system_instruction}]
+        for msg in messages:
+            role = msg["role"]
+            if role == "user":
+                nvidia_messages.append({
+                    "role": "user",
+                    "content": msg["content"]
+                })
+            elif role == "assistant":
+                item = {
+                    "role": "assistant",
+                    "content": msg["content"]
+                }
+                if msg.get("tool_calls"):
+                    item["tool_calls"] = []
+                    for tc in msg["tool_calls"]:
+                        item["tool_calls"].append({
+                            "id": tc["id"],
+                            "type": "function",
+                            "function": {
+                                "name": tc["name"],
+                                "arguments": json.dumps(tc["args"])
+                            }
+                        })
+                nvidia_messages.append(item)
+            elif role == "tool":
+                nvidia_messages.append({
+                    "role": "tool",
+                    "tool_call_id": msg["tool_call_id"],
+                    "name": msg["name"],
+                    "content": msg["content"]
+                })
+
+        nvidia_tools = []
+        for tool in tools_decl:
+            nvidia_tools.append({
+                "type": "function",
+                "function": {
+                    "name": tool["name"],
+                    "description": tool["description"],
+                    "parameters": tool["parameters"]
+                }
+            })
 
         payload = {
             "model": self.model,
-            "messages": [
-                {"role": "system", "content": system_instruction},
-                {"role": "user", "content": f"Review these diffs:\n{file_diffs_text}"}
-            ],
+            "messages": nvidia_messages,
+            "tools": nvidia_tools,
             "temperature": 0.2,
-            "max_tokens": 2048,
-            "response_format": {"type": "json_object"}
+            "max_tokens": 2048
         }
 
         import time
@@ -211,7 +303,7 @@ class NvidiaClient:
         backoff_factor = 2
 
         for attempt in range(max_retries):
-            logger.info(f"Submitting diffs to NVIDIA ({self.model}) (Attempt {attempt + 1}/{max_retries})...")
+            logger.info(f"Submitting chat history to NVIDIA ({self.model}) (Attempt {attempt + 1}/{max_retries})...")
             response = requests.post(self.url, json=payload, headers=self.headers)
             
             if response.status_code == 429:
@@ -225,46 +317,63 @@ class NvidiaClient:
             response.raise_for_status()
             break
 
-        response_json = response.json()
-        text = response_json["choices"][0]["message"]["content"]
-        
-        # Clean any potential markdown code blocks (e.g. ```json ... ```)
-        text = text.strip()
-        if text.startswith("```json"):
-            text = text[7:]
-        if text.endswith("```"):
-            text = text[:-3]
-        text = text.strip()
-        
-        return json.loads(text)
+        resp_json = response.json()
+        message = resp_json["choices"][0]["message"]
+        reply_text = message.get("content")
 
+        tool_calls = []
+        if "tool_calls" in message:
+            for tc in message["tool_calls"]:
+                tool_calls.append({
+                    "id": tc["id"],
+                    "name": tc["function"]["name"],
+                    "args": json.loads(tc["function"]["arguments"])
+                })
+
+        assistant_msg = {
+            "role": "assistant",
+            "content": reply_text
+        }
+        if tool_calls:
+            assistant_msg["tool_calls"] = tool_calls
+
+        class ChatResponse:
+            def __init__(self, message, text, tool_calls):
+                self.message = message
+                self.text = text
+                self.tool_calls = tool_calls
+
+        return ChatResponse(assistant_msg, reply_text, tool_calls)
+
+    def format_tool_response(self, tool_call_id, name, content):
+        return {
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "name": name,
+            "content": str(content)
+        }
 
 class PRReviewerAgent:
-    """Orchestrates the PR retrieval, filtering, analysis, commenting, and merging lifecycle."""
+    """Orchestrates the ReAct code reviewer agent loop."""
     def __init__(self, github: GithubClient, llm):
         self.github = github
         self.llm = llm
         self.skip_extensions = set((".png", ".jpg", ".jpeg", ".pdf", ".lock", ".ico", ".svg", ".zip", ".tar.gz"))
+        self.valid_paths = set()
 
     def _should_skip(self, filename):
-        """Returns True if the file type or name should not be sent to the LLM (noise filtering)."""
         ext = os.path.splitext(filename)[1].lower()
         if ext in self.skip_extensions or "lock" in filename.lower():
             return True
         return False
 
     def _resolve_file_path(self, llm_path, valid_paths):
-        """Normalizes and resolves the path returned by the LLM against actual PR files."""
         if not llm_path:
             return ""
-        # Normalize separators
         clean_path = llm_path.replace("\\", "/").strip("/")
-        
-        # Exact match
         if clean_path in valid_paths:
             return clean_path
             
-        # Try matching ignoring any duplicate directory prefixes (e.g. v1_unsecured/v1_unsecured/main.py)
         parts = clean_path.split("/")
         cleaned_parts = []
         for part in parts:
@@ -274,18 +383,73 @@ class PRReviewerAgent:
         if deduped_path in valid_paths:
             return deduped_path
             
-        # Suffix matching (e.g., if LLM returned 'v1_unsecured/v1_unsecured/.env.example' or 'v1_unsecured/.gitignore')
         suffix_matches = [vp for vp in valid_paths if clean_path.endswith(vp) or vp.endswith(clean_path)]
         if len(suffix_matches) == 1:
             return suffix_matches[0]
             
-        # Basename matching as final fallback
         basename = os.path.basename(clean_path)
         basename_matches = [vp for vp in valid_paths if os.path.basename(vp) == basename]
         if len(basename_matches) == 1:
             return basename_matches[0]
             
         return clean_path
+
+    def read_repo_file(self, path):
+        """Reads a file from the repository, returning its content as a string."""
+        if not path:
+            return "Error: Path cannot be empty."
+        
+        # Normalize and resolve relative to BASE_DIR or workspace root
+        full_path = os.path.abspath(path)
+        if not os.path.exists(full_path):
+            full_path = os.path.abspath(os.path.join(BASE_DIR, path))
+            
+        logger.info(f"Reading file: {path} (Resolved: {full_path})")
+        
+        if not os.path.exists(full_path):
+            return f"Error: File not found at {path}"
+            
+        try:
+            with open(full_path, "r", encoding="utf-8") as f:
+                return f.read()
+        except Exception as e:
+            return f"Error reading file: {str(e)}"
+
+    def post_line_comment(self, pr_number, commit_sha, file_path, line_number, message, suggestion=None):
+        """Posts a review comment bound to a specific line in the PR diff."""
+        resolved_file = self._resolve_file_path(file_path, self.valid_paths)
+        body = f"**[REVIEW ISSUE]** {message}"
+        if suggestion:
+            body += f"\nSuggest: `{suggestion}`"
+            
+        try:
+            self.github.post_line_comment(
+                pr_number=pr_number,
+                commit_sha=commit_sha,
+                file_path=resolved_file,
+                line_number=int(line_number),
+                body=body
+            )
+            return f"Successfully posted line comment on {resolved_file}:{line_number}."
+        except Exception as e:
+            logger.warning(f"Failed to post line comment on {resolved_file}:{line_number} - {str(e)}")
+            return f"Error posting line comment: {str(e)}"
+
+    def submit_review(self, pr_number, commit_sha, decision, summary):
+        """Submits the final review decision (APPROVE/REJECT) and general comment summary."""
+        body = f"### Code Review Summary\n\n{summary}\n\n**Decision**: {decision}"
+        try:
+            self.github.post_general_comment(pr_number, body)
+            if decision == "APPROVE":
+                try:
+                    self.github.merge_pull_request(pr_number, commit_sha)
+                    return f"Successfully submitted review with decision {decision} and merged PR."
+                except Exception as merge_err:
+                    return f"Successfully submitted review with decision {decision}, but merge failed: {str(merge_err)}"
+            else:
+                return f"Successfully submitted review with decision {decision}. PR remains open."
+        except Exception as e:
+            return f"Error submitting review: {str(e)}"
 
     def run(self):
         try:
@@ -300,6 +464,7 @@ class PRReviewerAgent:
 
             files = self.github.fetch_pr_files(pr_num)
             diffs_to_review = []
+            self.valid_paths = {f["filename"] for f in files}
 
             for f in files:
                 filename = f["filename"]
@@ -307,65 +472,110 @@ class PRReviewerAgent:
                 if not patch or self._should_skip(filename):
                     logger.info(f"Skipping file {filename} (binary or noise).")
                     continue
-
                 diffs_to_review.append(f"--- File: {filename}\n{patch}")
 
             if not diffs_to_review:
                 logger.info("No valid diffs to review after filtering. Exiting.")
                 return
 
-            try:
-                review_data = self.llm.review_diffs("\n\n".join(diffs_to_review))
-            except Exception as e:
-                logger.error(f"Failed to fetch review from LLM: {str(e)}")
-                try:
-                    self.github.post_general_comment(pr_num, f"### Code Review Error\n\nFailed to fetch review from LLM: {str(e)}")
-                except Exception as post_err:
-                    logger.error(f"Failed to post error comment: {str(post_err)}")
-                return
+            tools_declaration = [
+                {
+                    "name": "read_repo_file",
+                    "description": "Reads the content of a file inside the repository path.",
+                    "parameters": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "path": {"type": "STRING", "description": "The relative path of the file to read."}
+                        },
+                        "required": ["path"]
+                    }
+                },
+                {
+                    "name": "post_line_comment",
+                    "description": "Posts a review comment bound to a specific line in a PR file.",
+                    "parameters": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "file": {"type": "STRING", "description": "The relative path of the file."},
+                            "line": {"type": "INTEGER", "description": "The line number in the file."},
+                            "message": {"type": "STRING", "description": "Review comment message detailing the issue."},
+                            "suggestion": {"type": "STRING", "description": "Optional code suggestion for the fix."}
+                        },
+                        "required": ["file", "line", "message"]
+                    }
+                },
+                {
+                    "name": "submit_review",
+                    "description": "Submits the overall review decision for the pull request.",
+                    "parameters": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "decision": {"type": "STRING", "enum": ["APPROVE", "REJECT"], "description": "The overall PR review decision."},
+                            "summary": {"type": "STRING", "description": "A summary of the review findings."}
+                        },
+                        "required": ["decision", "summary"]
+                    }
+                }
+            ]
 
-            # Post line comments for each issue found
-            valid_paths = {f["filename"] for f in files}
-            for comment in review_data.get("comments", []):
-                llm_file = comment.get("file", "")
-                resolved_file = self._resolve_file_path(llm_file, valid_paths)
-                
-                body = (
-                    f"**[{comment['category'].upper()} - {comment['severity'].upper()}]** {comment['message']}\n"
-                    f"Suggest: `{comment.get('suggestion', '')}`"
-                )
+            initial_prompt = f"Review these diffs:\n" + "\n\n".join(diffs_to_review)
+            messages = [{"role": "user", "content": initial_prompt}]
 
+            max_turns = 10
+            turn = 0
+            submitted = False
+
+            while turn < max_turns and not submitted:
+                logger.info(f"ReAct Loop Turn {turn + 1}/{max_turns}...")
                 try:
-                    self.github.post_line_comment(
-                        pr_number=pr_num,
-                        commit_sha=commit_sha,
-                        file_path=resolved_file,
-                        line_number=comment["line"],
-                        body=body
-                    )
+                    response = self.llm.chat(messages, tools_declaration)
                 except Exception as e:
-                    logger.warning(f"Failed to post line comment on {resolved_file}:{comment['line']} - {str(e)}")
+                    logger.error(f"Failed to fetch response from LLM: {str(e)}")
+                    self.github.post_general_comment(pr_num, f"### Code Review Error\n\nFailed to fetch review from LLM: {str(e)}")
+                    return
 
-            # Post overall summary and execute decision
-            decision = review_data.get("decision", "REJECT")
-            summary_body = f"### Code Review Summary\n\n{review_data.get('summary', '')}\n\n**Decision**: {decision}"
-            try:
-                self.github.post_general_comment(pr_num, summary_body)
-            except Exception as e:
-                logger.error(f"Failed to post general summary comment: {str(e)}")
+                if response.tool_calls:
+                    messages.append(response.message)
+                    for tc in response.tool_calls:
+                        tool_name = tc["name"]
+                        tool_args = tc["args"]
+                        tool_call_id = tc.get("id")
 
-            if decision == "REJECT":
-                logger.info(f"PR #{pr_num} rejected or requires manual intervention.")
-                return
-            
-            try:
-                self.github.merge_pull_request(pr_num, commit_sha)
-                logger.info(f"PR #{pr_num} approved and auto-merged successfully.")
-            except Exception as e:
-                logger.error(f"Failed to merge PR #{pr_num}: {str(e)}")
+                        logger.info(f"Agent executing tool call: {tool_name} with args: {tool_args}")
+
+                        if tool_name == "read_repo_file":
+                            result = self.read_repo_file(tool_args.get("path", ""))
+                        elif tool_name == "post_line_comment":
+                            result = self.post_line_comment(
+                                pr_num, commit_sha,
+                                tool_args.get("file", ""),
+                                tool_args.get("line", 0),
+                                tool_args.get("message", ""),
+                                tool_args.get("suggestion")
+                            )
+                        elif tool_name == "submit_review":
+                            result = self.submit_review(
+                                pr_num, commit_sha,
+                                tool_args.get("decision", "REJECT"),
+                                tool_args.get("summary", "")
+                            )
+                            submitted = True
+                        else:
+                            result = f"Error: Tool {tool_name} not found."
+
+                        tool_msg = self.llm.format_tool_response(tool_call_id, tool_name, result)
+                        messages.append(tool_msg)
+                else:
+                    logger.info(f"Agent finished turn with text reply: {response.text}")
+                    messages.append(response.message)
+                    # If it did not call submit_review, force complete to avoid infinite loop
+                    self.submit_review(pr_num, commit_sha, "REJECT", "Agent failed to submit a structured review tool call.")
+                    break
+
+                turn += 1
+
         except Exception as e:
             logger.error(f"Unexpected error in agent loop: {str(e)}")
-
 
 if __name__ == "__main__":
     if not GITHUB_TOKEN or not REPO_OWNER or not REPO_NAME:
